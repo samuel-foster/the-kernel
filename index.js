@@ -39,9 +39,10 @@ const client = new Client({
     }
 });
 
-// Rate limiting setup
+// State management for interactive commands
 const COOLDOWN_MS = 5000; 
 const lastUsed = new Map();
+const pendingAdds = new Map(); // Key: chatId:userId, Value: Array of search results
 
 client.on('qr', (qr) => {
     console.log('[THE KERNEL // AUTH_REQUIRED] Please scan:');
@@ -52,25 +53,26 @@ client.on('ready', () => {
     console.log('[THE KERNEL // SYSTEM_READY] Online and monitoring.');
 });
 
-client.on('auth_failure', (msg) => {
-    console.error('[THE KERNEL // AUTH_FAILURE]', msg);
-});
-
 async function getStreamingSources(imdbID) {
     if (!WATCHMODE_API_KEY || WATCHMODE_API_KEY === 'YOUR_WATCHMODE_KEY') return null;
     try {
-        const url = `https://api.watchmode.com/v1/title/${imdbID}/sources/?apiKey=${WATCHMODE_API_KEY}&regions=US`;
-        const res = await axios.get(url, { timeout: 8000 });
-        const sources = res.data;
+        const searchUrl = `https://api.watchmode.com/v1/search/?apiKey=${WATCHMODE_API_KEY.trim()}&search_value=${imdbID}&search_field=imdb_id`;
+        const searchRes = await axios.get(searchUrl, { timeout: 8000 });
+        if (!searchRes.data.title_results || searchRes.data.title_results.length === 0) return null;
+        
+        const wmID = searchRes.data.title_results[0].id;
+        const sourcesUrl = `https://api.watchmode.com/v1/title/${wmID}/sources/?apiKey=${WATCHMODE_API_KEY.trim()}`;
+        const sourcesRes = await axios.get(sourcesUrl, { timeout: 8000 });
+        const sources = sourcesRes.data;
         if (!sources || !Array.isArray(sources)) return null;
         
         const uniqueSources = [...new Set(sources
-            .filter(s => s.type === 'sub')
+            .filter(s => s.type === 'sub' || s.type === 'free')
             .map(s => s.name))];
             
         return uniqueSources.length > 0 ? uniqueSources.join(', ') : null;
     } catch (err) {
-        console.error('[THE KERNEL // WATCHMODE_ERROR]', err.message);
+        console.error(`[THE KERNEL // WATCHMODE_ERROR] ${err.message}`);
         return null;
     }
 }
@@ -79,7 +81,7 @@ async function getTrailer(title, year) {
     if (!YOUTUBE_API_KEY || YOUTUBE_API_KEY === 'YOUR_YOUTUBE_KEY') return null;
     try {
         const query = encodeURIComponent(`${title} ${year} Official Trailer`);
-        const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${query}&key=${YOUTUBE_API_KEY}&maxResults=1&type=video`;
+        const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${query}&key=${YOUTUBE_API_KEY.trim()}&maxResults=1&type=video`;
         const res = await axios.get(url, { timeout: 8000 });
         if (res.data.items && res.data.items.length > 0) {
             return `https://www.youtube.com/watch?v=${res.data.items[0].id.videoId}`;
@@ -94,22 +96,16 @@ async function getTrailer(title, year) {
 async function handleOMDbRequest(msg, query, type) {
     const now = Date.now();
     const sender = msg.from;
-    
-    if (lastUsed.has(sender) && (now - lastUsed.get(sender) < COOLDOWN_MS)) {
-        return; 
-    }
+    if (lastUsed.has(sender) && (now - lastUsed.get(sender) < COOLDOWN_MS)) return;
     lastUsed.set(sender, now);
     
-    console.log(`[THE KERNEL // API_QUERY] Fetching ${type}: "${query}"`);
-    
     try {
-        const res = await axios.get(`http://www.omdbapi.com/?t=${query}&type=${type}&apikey=${OMDB_API_KEY}`, { timeout: 8000 });
+        const res = await axios.get(`http://www.omdbapi.com/?t=${query}&type=${type}&apikey=${OMDB_API_KEY.trim()}`, { timeout: 8000 });
         const data = res.data;
 
         if (data.Response === 'True') {
             const isMovie = data.Type === 'movie';
             const icon = isMovie ? '🎬' : '📺';
-            
             const [streaming, trailer] = await Promise.all([
                 getStreamingSources(data.imdbID),
                 getTrailer(data.Title, data.Year)
@@ -134,33 +130,59 @@ async function handleOMDbRequest(msg, query, type) {
     }
 }
 
+async function saveToWatchlist(chatId, title, year, type, addedBy) {
+    try {
+        const stmt = db.prepare('INSERT INTO watchlists (chat_id, title, year, type, added_by) VALUES (?, ?, ?, ?, ?)');
+        stmt.run(chatId, title, year, type, addedBy);
+        return true;
+    } catch (err) {
+        console.error('[THE KERNEL // DB_ERROR]', err.message);
+        return false;
+    }
+}
+
 async function handleWatchlist(msg) {
     const chatId = msg.from;
+    const authorId = msg.author || msg.from;
     const body = msg.body.trim();
+    const userKey = `${chatId}:${authorId}`;
 
     if (body.startsWith('!add ')) {
-        const titleQuery = body.split('!add ')[1]?.trim();
-        if (!titleQuery) return;
+        const query = body.split('!add ')[1]?.trim();
+        if (!query) return;
 
         try {
-            const res = await axios.get(`http://www.omdbapi.com/?t=${titleQuery}&apikey=${OMDB_API_KEY}`, { timeout: 8000 });
-            const data = res.data;
-
-            if (data.Response === 'True') {
-                const stmt = db.prepare('INSERT INTO watchlists (chat_id, title, year, type, added_by) VALUES (?, ?, ?, ?, ?)');
-                const contact = await msg.getContact();
-                stmt.run(chatId, data.Title, data.Year, data.Type, contact.pushname || contact.number);
+            // Use Search (s=) instead of Title (t=) to find multiple matches
+            const res = await axios.get(`http://www.omdbapi.com/?s=${encodeURIComponent(query)}&apikey=${OMDB_API_KEY.trim()}`, { timeout: 8000 });
+            
+            if (res.data.Response === 'True') {
+                const results = res.data.Search.slice(0, 5); // Take top 5
                 
-                await client.sendMessage(chatId, `✅ Added *${data.Title}* (${data.Year}) to the watchlist!`);
+                if (results.length === 1) {
+                    // Only one match, add immediately
+                    const contact = await msg.getContact();
+                    await saveToWatchlist(chatId, results[0].Title, results[0].Year, results[0].Type, contact.pushname || contact.number);
+                    await client.sendMessage(chatId, `✅ Added *${results[0].Title}* (${results[0].Year}) to the watchlist!`);
+                } else {
+                    // Multiple matches, ask for selection
+                    let menu = `🤔 *Multiple matches found for "${query}"*\nReply with the number to add:\n\n`;
+                    results.forEach((item, i) => {
+                        const icon = item.Type === 'movie' ? '🎬' : '📺';
+                        menu += `${i + 1}. ${icon} ${item.Title} (${item.Year})\n`;
+                    });
+                    menu += `\n_Type "cancel" to stop._`;
+                    
+                    pendingAdds.set(userKey, results);
+                    await client.sendMessage(chatId, menu);
+                }
             } else {
-                await client.sendMessage(chatId, `❌ Could not find "${titleQuery}" to add.`);
+                await client.sendMessage(chatId, `❌ Could not find any movies or shows matching "${query}".`);
             }
         } catch (err) {
-            console.error('[THE KERNEL // DB_ERROR]', err.message);
+            console.error('[THE KERNEL // SEARCH_ERROR]', err.message);
         }
     } else if (body === '!watchlist') {
         const rows = db.prepare('SELECT title, year, type FROM watchlists WHERE chat_id = ? ORDER BY timestamp DESC').all(chatId);
-        
         if (rows.length === 0) {
             await client.sendMessage(chatId, `📂 The watchlist is currently empty.`);
         } else {
@@ -173,9 +195,8 @@ async function handleWatchlist(msg) {
         }
     } else if (body === '!pick') {
         const rows = db.prepare('SELECT title, year, type FROM watchlists WHERE chat_id = ?').all(chatId);
-        
         if (rows.length === 0) {
-            await client.sendMessage(chatId, `📂 The watchlist is empty, nothing to pick!`);
+            await client.sendMessage(chatId, `📂 The watchlist is empty!`);
         } else {
             const random = rows[Math.floor(Math.random() * rows.length)];
             const icon = random.type === 'movie' ? '🎬' : '📺';
@@ -187,22 +208,57 @@ async function handleWatchlist(msg) {
 client.on('message_create', async (msg) => {
     if (msg.fromMe) return;
 
-    const body = msg.body.toLowerCase();
+    const chatId = msg.from;
+    const authorId = msg.author || msg.from;
+    const userKey = `${chatId}:${authorId}`;
+    const body = msg.body.trim();
+    const lowerBody = body.toLowerCase();
 
-    if (body.startsWith('!movie ')) {
-        const query = msg.body.split('!movie ')[1]?.trim();
+    // Check if user has a pending selection
+    if (pendingAdds.has(userKey)) {
+        if (lowerBody === 'cancel') {
+            pendingAdds.delete(userKey);
+            await client.sendMessage(chatId, `👍 Selection cancelled.`);
+            return;
+        }
+
+        const selection = parseInt(body);
+        const results = pendingAdds.get(userKey);
+
+        if (!isNaN(selection) && selection >= 1 && selection <= results.length) {
+            const item = results[selection - 1];
+            const contact = await msg.getContact();
+            await saveToWatchlist(chatId, item.Title, item.Year, item.Type, contact.pushname || contact.number);
+            pendingAdds.delete(userKey);
+            await client.sendMessage(chatId, `✅ Added *${item.Title}* (${item.Year}) to the watchlist!`);
+            return;
+        }
+    }
+
+    if (lowerBody === '!help' || lowerBody === '!commands') {
+        const help = `🤖 *The Kernel // COMMAND_MENU*\n\n` +
+                     `📽️ *Search*\n` +
+                     `• !movie [title] — Info, Streaming & Trailer\n` +
+                     `• !show [title] — TV Series details\n\n` +
+                     `📋 *Watchlist*\n` +
+                     `• !add [title] — Save to group list\n` +
+                     `• !watchlist — View group list\n` +
+                     `• !pick — Randomly pick from list\n\n` +
+                     `ℹ️ _Type a number to select from lists!_`;
+        await client.sendMessage(chatId, help);
+    } else if (lowerBody.startsWith('!movie ')) {
+        const query = body.split('!movie ')[1]?.trim();
         if (query) await handleOMDbRequest(msg, query, 'movie');
-    } else if (body.startsWith('!show ')) {
-        const query = msg.body.split('!show ')[1]?.trim();
+    } else if (lowerBody.startsWith('!show ')) {
+        const query = body.split('!show ')[1]?.trim();
         if (query) await handleOMDbRequest(msg, query, 'series');
-    } else if (body.startsWith('!add ') || body === '!watchlist' || body === '!pick') {
+    } else if (lowerBody.startsWith('!add ') || lowerBody === '!watchlist' || lowerBody === '!pick') {
         await handleWatchlist(msg);
     }
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
     console.error('[THE KERNEL // SYSTEM_ERROR] Unhandled Rejection:', reason);
 });
 
-console.log('[THE KERNEL // STARTUP] Initializing...');
 client.initialize();
